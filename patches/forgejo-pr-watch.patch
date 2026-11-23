@@ -1,3 +1,40 @@
+diff --git a/packages/web/server/lib/gitea/mappers.test.js b/packages/web/server/lib/gitea/mappers.test.js
+index b738f6e..e766d14 100644
+--- a/packages/web/server/lib/gitea/mappers.test.js
++++ b/packages/web/server/lib/gitea/mappers.test.js
+@@ -120,4 +120,11 @@ describe('Gitea mappers', () => {
+       state: 'open', mergeable: true, mergeableState: 'clean', checks: { state: 'pending', total: 2 }, base: 'main', headSha: HEAD,
+     });
+   });
++
++  it('counts issue comments and review comments as activity', () => {
++    const ci = mapGiteaCI(fixtures.combinedStatus, identity);
++    const raw = { ...fixtures.forkPull, comments: 2, review_comments: 3 };
++    expect(liveChangeRequestSummary({ owner: 'alice', repo: 'app', number: 1 }, raw, ci)).toMatchObject({ activity: 5 });
++    expect(liveChangeRequestSummary({ owner: 'alice', repo: 'app', number: 1 }, fixtures.forkPull, ci)).toMatchObject({ activity: 4 });
++  });
+ });
+diff --git a/packages/web/server/lib/gitea/mappers.ts b/packages/web/server/lib/gitea/mappers.ts
+index a4780fe..830d743 100644
+--- a/packages/web/server/lib/gitea/mappers.ts
++++ b/packages/web/server/lib/gitea/mappers.ts
+@@ -340,7 +340,7 @@ export function liveChangeRequestSummary(ref: GiteaRepoRef, raw: JsonValue | und
+   const checks = state === 'open' && ci ? { ...ci.summary } : null;
+   const summary: GiteaRepoRef & {
+     number: number; state: typeof state; draft: boolean; title: string; mergeable: boolean | null;
+-    mergeableState: typeof mergeableState; checks: GiteaCheckSummary | null; headSha?: string; base?: string;
++    mergeableState: typeof mergeableState; checks: GiteaCheckSummary | null; activity: number; headSha?: string; base?: string;
+   } = {
+     owner: ref.owner,
+     repo: ref.repo,
+@@ -351,6 +351,7 @@ export function liveChangeRequestSummary(ref: GiteaRepoRef, raw: JsonValue | und
+     mergeable: state === 'open' && (raw.mergeable === true || raw.mergeable === false) ? raw.mergeable : null,
+     mergeableState,
+     checks,
++    activity: (nonNegativeInteger(raw.comments) ? raw.comments : 0) + (nonNegativeInteger(raw.review_comments) ? raw.review_comments : 0),
+   };
+   const sha = field(raw.head, 'sha');
+   if (nonEmptyText(sha)) summary.headSha = sha;
 diff --git a/packages/web/server/lib/openchamber-control/actions.ts b/packages/web/server/lib/openchamber-control/actions.ts
 index 81198f2..cfa0945 100644
 --- a/packages/web/server/lib/openchamber-control/actions.ts
