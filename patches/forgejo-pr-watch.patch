@@ -1,0 +1,233 @@
+diff --git a/packages/web/server/lib/openchamber-control/actions.ts b/packages/web/server/lib/openchamber-control/actions.ts
+index 81198f2..cfa0945 100644
+--- a/packages/web/server/lib/openchamber-control/actions.ts
++++ b/packages/web/server/lib/openchamber-control/actions.ts
+@@ -14,10 +14,10 @@ export const OPENCHAMBER_CONTROL_ACTION_DEFINITIONS = Object.freeze([
+   { action: 'session.moveToWorktree', title: 'Move a session into a new worktree', description: 'Move sessionId (default: this session) and its carry files into a new worktree, made the way the New worktree dialog makes one; requires worktree. Nothing moves when carry cannot be applied; directory is ignored' },
+   { action: 'session.link', title: 'Link a change or issue to a session', description: 'Add link to sessionId (default: this session); the same link again updates its title' },
+   { action: 'session.unlink', title: 'Remove a link from a session', description: 'Remove a link from sessionId (default: this session), named by the url or identifier it was linked with' },
+-  { action: 'pr.watch', title: 'Wait on a pull request', description: 'Requires url of a GitHub pull request or GitLab merge request. Same as wait.start with source "pr"', agentExposed: false },
++  { action: 'pr.watch', title: 'Wait on a pull request', description: 'Requires url of a GitHub pull request, GitLab merge request, or Gitea/Forgejo pull request. Same as wait.start with source "pr"', agentExposed: false },
+   { action: 'pr.unwatch', title: 'Stop waiting on a pull request', description: 'This session stops waiting on the pull request at url, or on every one without url', agentExposed: false },
+   { action: 'wait.list', title: 'List waits', description: "This session's waits, and the sources to wait on (the built-in timer, pull requests, and what extensions offer), with the args each takes" },
+-  { action: 'wait.start', title: 'Wait on a timer, a pull request or an extension', description: 'Requires source and args: "timer" with { "minutes": N } (1 to 1440); "pr" with { "url": "<GitHub pull request or GitLab merge request address>" }, which wakes the session when a check fails or every check passes, someone comments or reviews, the branch conflicts or falls behind, or it is merged or closed; or a source from wait.list with args as its params say. Each pull request is its own wait, so a session can wait on several. One wake ends the wait, so start it again to keep waiting. End your turn while you wait. Never wait with a sleep loop' },
++  { action: 'wait.start', title: 'Wait on a timer or a pull request', description: 'Requires source and args: "timer" with { "minutes": N } (1 to 1440); "pr" with { "url": "<GitHub pull request, GitLab merge request, Gitea or Forgejo pull request address>" }, which wakes the session when a check fails or every check passes, someone comments or reviews, the branch conflicts or falls behind, or it is merged or closed; or a source from wait.list with args as its params say. Each pull request is its own wait, so a session can wait on several. One wake ends the wait, so start it again to keep waiting. End your turn while you wait. Never wait with a sleep loop' },
+   { action: 'wait.stop', title: 'Stop a wait', description: 'Stop waitId (a pull request wait\'s waitId is its address), or every wait of this session without it' },
+   { action: 'work.name', title: 'Name the task', description: 'Name the worktree\'s or isolated space\'s task for sessionId (default: this session), never a session; a lead\'s name is its session title, so for a lead it renames the session. In title: at most 4 words in the user\'s latest language; rename only for a different task. A user-given name stays. Main checkout and plain folders need no naming. A worktree on an OpenChamber-generated placeholder branch also requires branch, the English branch name after the task, and renames it; any other branch stays' },
+   { action: 'lead.brief', title: "Keep the lead's brief", description: 'Only in a lead session. Without brief or edits it returns the brief; edits changes parts of it, brief replaces it whole' },
+diff --git a/packages/web/server/lib/pr-watch/DOCUMENTATION.md b/packages/web/server/lib/pr-watch/DOCUMENTATION.md
+index 6a34db5..5e0c37b 100644
+--- a/packages/web/server/lib/pr-watch/DOCUMENTATION.md
++++ b/packages/web/server/lib/pr-watch/DOCUMENTATION.md
+@@ -47,8 +47,11 @@ one it already waits on starts that watch over. `pr.unwatch` with `url` stops
+ that one, without it every one of the session; a supplied `url` that names no
+ pull request (empty, null, not a string) is a 400 that stops nothing. `item` is the tracked item
+ the address names (`parsePullRequestUrl`): a GitHub pull request, on another
+-host a GitHub Enterprise one, or a GitLab merge request read on its own
+-origin. Other providers are refused. `last` is the last state seen (state,
++host a GitHub Enterprise one, a GitLab merge request read on its own origin,
++or a Gitea/Forgejo pull request (`/pulls/N`) on a connected instance. Both
++Gitea-family hosts use the same address shape, so the one that owns the
++hostname is picked from the connected accounts (`resolvePullProvider` passed
++into `attach`); it defaults to Forgejo. Other providers are refused. `last` is the last state seen (state,
+ head commit, check outcome, merge state, `activity` count, title); `wake` is a
+ pending wake with its events and the id of the message that carries it.
+ 
+diff --git a/packages/web/server/lib/pr-watch/runtime.test.js b/packages/web/server/lib/pr-watch/runtime.test.js
+index 9c272ca..49fdd9c 100644
+--- a/packages/web/server/lib/pr-watch/runtime.test.js
++++ b/packages/web/server/lib/pr-watch/runtime.test.js
+@@ -122,6 +122,17 @@ const until = async (check, timeoutMs = 2_000) => {
+ };
+ 
+ describe('parsePullRequestUrl', () => {
++  it('reads Forgejo and Gitea pull request addresses, with the host chosen from connected accounts', () => {
++    const url = 'https://repo.swx.smartloft.eu/Smartloft/traefik-fabric/pulls/21';
++    expect(parsePullRequestUrl(url)).toMatchObject({
++      provider: 'forgejo', instance: 'https://repo.swx.smartloft.eu', owner: 'Smartloft', repo: 'traefik-fabric', number: 21,
++    });
++    expect(parsePullRequestUrl(url, 'gitea')).toMatchObject({ provider: 'gitea', number: 21 });
++    expect(parsePullRequestUrl('https://gitea.example.com/a/b/pulls/3', 'gitea')).toMatchObject({
++      provider: 'gitea', instance: 'https://gitea.example.com', owner: 'a', repo: 'b', number: 3,
++    });
++  });
++
+   it('reads GitHub, GitHub Enterprise and GitLab addresses, and nothing else', () => {
+     expect(parsePullRequestUrl('https://github.com/acme/app/pull/7/files')).toMatchObject({ provider: 'github', owner: 'acme', repo: 'app', number: 7 });
+     expect(parsePullRequestUrl('https://git.acme.com/team/app/pull/3')).toMatchObject({ provider: 'github', instance: 'git.acme.com', number: 3 });
+diff --git a/packages/web/server/lib/pr-watch/runtime.ts b/packages/web/server/lib/pr-watch/runtime.ts
+index 0e8665d..767c4d2 100644
+--- a/packages/web/server/lib/pr-watch/runtime.ts
++++ b/packages/web/server/lib/pr-watch/runtime.ts
+@@ -19,6 +19,15 @@ const MAX_DELIVERY_FAILURES = 8;
+ const FETCH_TIMEOUT_MS = 15_000;
+ export const PR_WATCH_SOURCE = 'openchamber-pr-watch';
+ 
++const providerLabel = (provider: string) => {
++  switch (provider) {
++    case 'github': return 'GitHub';
++    case 'gitlab': return 'GitLab';
++    case 'gitea': return 'Gitea';
++    case 'forgejo': return 'Forgejo';
++    default: return provider;
++  }
++};
+ const EVENT_TEXT = {
+   merged: 'it was merged',
+   closed: 'it was closed without merging',
+@@ -129,6 +138,7 @@ export interface PrWatchOptions {
+     properties: { revision: number; sessionID: string; watches: PublicPrWatch[]; watch: PublicPrWatch | null };
+   }) => void;
+   dataDir: string;
++  resolvePullProvider?: (host: string) => Promise<'forgejo' | 'gitea' | null>;
+   readCleanupOnMerge?: () => Promise<boolean>;
+   isSessionArchived?: (sessionID: string) => boolean | Promise<boolean>;
+   insideSpace?: boolean;
+@@ -178,8 +188,10 @@ export interface PrWatchStopResult {
+ 
+ const GITHUB_PULL = /^\/([^/]+)\/([^/]+)\/pull\/(\d+)(?:\/|$)/;
+ const GITLAB_MERGE_REQUEST = /^\/(.+)\/([^/]+)\/-\/merge_requests\/(\d+)(?:\/|$)/;
++const FORGE_PULL = /^\/([^/]+)\/([^/]+)\/pulls\/(\d+)(?:\/|$)/;
++const FORGE_PROVIDERS = ['forgejo', 'gitea'] as const;
+ 
+-export const parsePullRequestUrl = (value: PrWatchInput['url']) => {
++export const parsePullRequestUrl = (value: PrWatchInput['url'], forgeProvider?: string) => {
+   const parsed = z.string().trim().min(1).safeParse(value);
+   const address = parsed.success ? parsed.data : null;
+   if (!address || !URL.canParse(address)) return null;
+@@ -198,9 +210,23 @@ export const parsePullRequestUrl = (value: PrWatchInput['url']) => {
+     const item = parseTrackedItem({ provider: 'gitlab', instance: url.origin, kind: 'pull', owner, repo, number: Number(number) });
+     return isPullItem(item) ? item : null;
+   }
++  const forge = FORGE_PULL.exec(url.pathname);
++  if (forge) {
++    const [, owner, repo, number] = forge;
++    const provider = FORGE_PROVIDERS.find((candidate) => candidate === forgeProvider) ?? 'forgejo';
++    const item = parseTrackedItem({ provider, instance: url.origin, kind: 'pull', owner, repo, number: Number(number) });
++    return isPullItem(item) ? item : null;
++  }
+   return null;
+ };
+ 
++export const pullHostOf = (value: PrWatchInput['url']) => {
++  const parsed = z.string().trim().min(1).safeParse(value);
++  if (!parsed.success || !URL.canParse(parsed.data)) return null;
++  const url = new URL(parsed.data);
++  return url.protocol === 'https:' || url.protocol === 'http:' ? url.hostname.toLowerCase().replace(/^www\./, '') : null;
++};
++
+ const snapshotOf = (value: TrackedWatchState['state']) => {
+   const parsed = pullStateSchema.safeParse(value);
+   const state = parsed.success ? parsed.data : null;
+@@ -292,8 +318,8 @@ const PR_WAIT = {
+   source: PR_WAIT_SOURCE,
+   extension: 'OpenChamber',
+   title: 'Pull request',
+-  description: 'Wakes the session when a check fails or every check passes, someone comments or reviews, the branch conflicts or falls behind, or it is merged or closed. Each pull request is its own wait; starting one again starts it over',
+-  params: { url: { type: 'string', description: 'Address of a GitHub pull request or GitLab merge request', required: true } },
++  description: 'Wakes the session when a check fails or every check passes, someone comments or reviews, the branch conflicts or falls behind, or it is merged or closed. Works with GitHub pull requests, GitLab merge requests and Gitea/Forgejo pull requests. Each pull request is its own wait; starting one again starts it over',
++  params: { url: { type: 'string', description: 'Address of a GitHub pull request, GitLab merge request, or Gitea/Forgejo pull request', required: true } },
+ };
+ 
+ const toPublicWait = (watch: Watch): PublicPrWait => ({
+@@ -316,6 +342,7 @@ export function createPrWatchRuntime({
+   getOpenCodeAuthHeaders,
+   broadcastUiEvent,
+   dataDir,
++  resolvePullProvider,
+   readCleanupOnMerge = async () => false,
+   isSessionArchived = () => false,
+   insideSpace = false,
+@@ -592,8 +619,13 @@ export function createPrWatchRuntime({
+     const sessionID = parsedSessionID.success ? parsedSessionID.data : null;
+     if (!sessionID) throw httpError('pr.watch must be called from a session', 400);
+     if (!directory) throw httpError('The session\'s directory is unknown', 400);
+-    const item = parsePullRequestUrl(url);
+-    if (!item) throw httpError('url must be the address of a GitHub pull request or a GitLab merge request', 400);
++    const parsedUrl = z.string().safeParse(url);
++    const address = parsedUrl.success ? parsedUrl.data.trim() : '';
++    const host = pullHostOf(address);
++    const isForge = Boolean(host && URL.canParse(address) && FORGE_PULL.test(new URL(address).pathname));
++    const provider = isForge && host ? await resolvePullProvider?.(host).catch(() => null) ?? undefined : undefined;
++    const item = parsePullRequestUrl(url, provider ?? undefined);
++    if (!item) throw httpError('url must be the address of a GitHub pull request, a GitLab merge request, or a Gitea/Forgejo pull request', 400);
+     if (!trackedItems || !readers) throw httpError('Pull request status is not available on this server yet', 503);
+     await load();
+ 
+@@ -608,7 +640,7 @@ export function createPrWatchRuntime({
+         issues: [],
+       });
+       if (result?.status === 'disconnected') {
+-        throw httpError(`OpenChamber has no ${item.provider === 'gitlab' ? 'GitLab' : 'GitHub'} account connected for ${threadInstance(item)}, so it cannot follow this pull request`, 400);
++        throw httpError(`OpenChamber has no ${providerLabel(item.provider)} account connected for ${threadInstance(item)}, so it cannot follow this pull request`, 400);
+       }
+       if (result?.status === 'ok') {
+         const summary = (result.pulls ?? []).find((pull: PullSummaryReference | null) => pull?.number === item.number);
+@@ -645,9 +677,13 @@ export function createPrWatchRuntime({
+     if (!sessionID) throw httpError('sessionID is invalid', 400);
+     const every = url === undefined;
+     const item = every ? null : parsePullRequestUrl(url);
+-    if (!every && !item) throw httpError('url must be the address of a GitHub pull request or a GitLab merge request', 400);
++    if (!every && !item) throw httpError('url must be the address of a GitHub pull request, a GitLab merge request, or a Gitea/Forgejo pull request', 400);
+     await load();
+-    const ending = watchesOf(sessionID).filter((watch) => every || (item !== null && trackedItemKey(watch.item) === trackedItemKey(item)));
++    const parsedUrl = z.string().safeParse(url);
++    const address = parsedUrl.success ? parsedUrl.data.trim() : '';
++    const ending = watchesOf(sessionID).filter((watch) => every
++      || (item !== null && trackedItemKey(watch.item) === trackedItemKey(item))
++      || (address !== '' && watch.url === address));
+     await drop(...ending);
+     return { watching: watchesOf(sessionID).map(toPublicWatch), stopped: ending.length > 0 };
+   };
+@@ -670,9 +706,14 @@ export function createPrWatchRuntime({
+     if (hasWake(status.properties.sessionID)) arm(status.properties.sessionID);
+   };
+ 
+-  const attach = ({ trackedItems: service, readers: itemReaders }: { trackedItems: PrWatchTrackedItems; readers: Readers }) => {
++  const attach = ({ trackedItems: service, readers: itemReaders, resolvePullProvider: resolver }: {
++    trackedItems: PrWatchTrackedItems;
++    readers: Readers;
++    resolvePullProvider?: PrWatchOptions['resolvePullProvider'];
++  }) => {
+     trackedItems = service;
+     readers = itemReaders;
++    if (resolver) resolvePullProvider = resolver;
+     unsubscribeTracked?.();
+     unsubscribeTracked = service.subscribe(onStatesChanged);
+     void load().then(syncInterest).catch(() => undefined);
+diff --git a/packages/web/server/lib/server-frame/feature-routes-runtime.ts b/packages/web/server/lib/server-frame/feature-routes-runtime.ts
+index dbf1685..67edde4 100644
+--- a/packages/web/server/lib/server-frame/feature-routes-runtime.ts
++++ b/packages/web/server/lib/server-frame/feature-routes-runtime.ts
+@@ -703,7 +703,30 @@ export const createFeatureRoutesRuntime = (dependencies: FeatureRuntimeDependenc
+       }
+     });
+     registerTrackedItemsRoutes(app, { service: trackedItemsService });
+-    prWatchRuntime?.attach({ trackedItems: trackedItemsService, readers: trackedItemReaders });
++    const resolveHostIdentity = async (host: string) => {
++      for (const descriptor of sourceControlProviders.list()) {
++        try {
++          const impl = await sourceControlProviders.implementation(descriptor.id);
++          if (!(impl?.auth?.ownsHost instanceof Function)) continue;
++          const knownInstances = [...(descriptor.instance.defaultInstances ?? []), ...(await impl.auth.listInstances?.() ?? [])];
++          const knownSshHosts = await impl.auth.listSshHosts?.() ?? [];
++          const instance = impl.auth.ownsHost({ host, knownInstances, knownSshHosts });
++          if (instance) return { provider: descriptor.id, instance };
++        } catch {
++          continue;
++        }
++      }
++      return null;
++    };
++    prWatchRuntime?.attach({
++      trackedItems: trackedItemsService,
++      readers: trackedItemReaders,
++      resolvePullProvider: async (host) => {
++        const identity = await resolveHostIdentity(host);
++        return identity?.provider === 'forgejo' || identity?.provider === 'gitea' ? identity.provider : null;
++      },
++    });
++
+     void mergeFollowRuntime?.attach(trackedItemsService).catch((error) => console.warn('[merge-follow] attach failed:', error.message));
+     const resolveGitIdentity = async (identityId: string) => {
+       if (identityId === 'global') {

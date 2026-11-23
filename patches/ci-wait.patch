@@ -1,0 +1,505 @@
+diff --git a/packages/web/server/lib/extension-waits/DOCUMENTATION.md b/packages/web/server/lib/extension-waits/DOCUMENTATION.md
+index f4db999..3276a90 100644
+--- a/packages/web/server/lib/extension-waits/DOCUMENTATION.md
++++ b/packages/web/server/lib/extension-waits/DOCUMENTATION.md
+@@ -11,10 +11,16 @@ fired, and wakes the session with one synthetic message when it did. One wake
+ ends the wait. `wait.stop` ends one or every wait of the calling session,
+ `wait.list` names the session's waits and every source it may start one on.
+ 
+-It also owns the one source that is not an extension's: the built-in `timer`
+-(`wait.start` with `source: "timer"`, `args: { minutes }`). The host keeps it
+-and fires it on the clock, with no extension, no service and no approval
+-behind it, and delivers its wake like any other.
++It also owns the two sources that are not an extension's. The built-in `timer`
++(`wait.start` with `source: "timer"`, `args: { minutes }`) fires on the clock,
++with no extension, no service and no approval behind it. The built-in `ci`
++(`source: "ci"`, `args: { url }`) watches the combined check status of a commit
++or a branch head without needing a pull request: the address is resolved to a
++connected Git host, `checkCommitCI` (supplied by `server-frame/feature-routes-runtime.ts`
++through `attach`) reads it through that host's `resources.commitStatus`, and
++the wait fires once the state turns `success` or `failure`. Branch addresses
++are re-read at the interval, so a new head starts a fresh comparison. Both are
++host-owned and delivered like any other wait.
+ 
+ Wiring: created in `server/index.js` after `../pr-watch`, handed to the
+ control service as `extensionWaits` (`../openchamber-control/service.js`,
+diff --git a/packages/web/server/lib/extension-waits/runtime.test.js b/packages/web/server/lib/extension-waits/runtime.test.js
+index c2e1c84..34f9f8b 100644
+--- a/packages/web/server/lib/extension-waits/runtime.test.js
++++ b/packages/web/server/lib/extension-waits/runtime.test.js
+@@ -4,7 +4,7 @@ import os from 'node:os';
+ import path from 'node:path';
+ import { afterEach, describe, expect, it, vi } from 'vitest';
+ 
+-import { EXTENSION_WAIT_SOURCE, createExtensionWaitsRuntime, isWaitProvider } from './runtime.js';
++import { EXTENSION_WAIT_SOURCE, createExtensionWaitsRuntime, isWaitProvider, parseCiUrl } from './runtime.js';
+ 
+ const SESSION = 'ses_agent';
+ const DIRECTORY = '/repo';
+@@ -96,7 +96,7 @@ const createService = ({ start = () => ({ ok: true, state: { checks: 0 }, label:
+   return { calls: requests.events, proxyServiceRequest, checked: () => requests.waitFor((call) => call.path === '/waits/check') };
+ };
+ 
+-const createRuntime = async ({ dataDir, catalog = [guest()], service = createService(), openCode = createOpenCode(), timers, insideSpace, retryDelayMs = () => 5 } = {}) => {
++const createRuntime = async ({ dataDir, catalog = [guest()], service = createService(), openCode = createOpenCode(), timers, insideSpace, retryDelayMs = () => 5, resolveCiHost, checkCommitCI } = {}) => {
+   let eventHandler = () => {};
+   const clock = { now: 1_000_000 };
+   // `catalogError` set: the catalog read fails with it.
+@@ -120,6 +120,8 @@ const createRuntime = async ({ dataDir, catalog = [guest()], service = createSer
+     warn: () => {},
+     timers,
+     insideSpace,
++    resolveCiHost,
++    checkCommitCI,
+   });
+   runtimes.push(runtime);
+   runtime.start({
+@@ -682,10 +684,11 @@ describe('createExtensionWaitsRuntime', () => {
+ 
+     it('is a source wait.list names, beside the extensions\' ones', async () => {
+       const timerSource = { source: 'timer', extension: 'OpenChamber', title: 'Timer', params: { minutes: { type: 'number', required: true } } };
++      const ciSource = { source: 'ci', extension: 'OpenChamber', title: 'CI', params: { url: { type: 'string', required: true } } };
+       const alone = await createRuntime({ catalog: [] });
+-      expect((await alone.runtime.listWaits(SESSION)).sources).toMatchObject([timerSource]);
++      expect((await alone.runtime.listWaits(SESSION)).sources).toMatchObject([timerSource, ciSource]);
+       const beside = await createRuntime();
+-      expect((await beside.runtime.listWaits(SESSION)).sources).toMatchObject([timerSource, { source: 'wait-kit/timer' }]);
++      expect((await beside.runtime.listWaits(SESSION)).sources).toMatchObject([timerSource, ciSource, { source: 'wait-kit/timer' }]);
+     });
+ 
+     it('is refused and not offered inside an isolated space', async () => {
+@@ -775,3 +778,55 @@ describe('createExtensionWaitsRuntime', () => {
+     });
+   });
+ });
++
++describe('the built-in ci wait', () => {
++  const URL_COMMIT = 'https://repo.swx.smartloft.eu/Smartloft/traefik-fabric/commit/3a526182290055fb2fef797ebba367c98917fe1b';
++  const URL_BRANCH = 'https://repo.swx.smartloft.eu/Smartloft/traefik-fabric/src/branch/main';
++  const IDENTITY = { provider: 'forgejo', instance: 'https://repo.swx.smartloft.eu' };
++
++  it('reads commit and branch addresses, including GitLab and GitHub', () => {
++    expect(parseCiUrl(URL_COMMIT, IDENTITY)).toMatchObject({ ...IDENTITY, owner: 'Smartloft', repo: 'traefik-fabric', sha: '3a526182290055fb2fef797ebba367c98917fe1b' });
++    expect(parseCiUrl(URL_BRANCH, IDENTITY)).toMatchObject({ ...IDENTITY, branch: 'main' });
++    expect(parseCiUrl('https://github.com/acme/app/commit/abc1234')).toMatchObject({ provider: 'github', sha: 'abc1234' });
++    expect(parseCiUrl('https://gitlab.com/g/app/-/commit/abc1234')).toMatchObject({ provider: 'gitlab', sha: 'abc1234' });
++    expect(parseCiUrl('https://repo.example.com/a/b/pulls/4', IDENTITY)).toBeNull();
++  });
++
++  it('wakes when CI finishes on a watched branch, with the names of the checks', async () => {
++    let state = { sha: 'aaa1111', state: 'pending' };
++    const checked = vi.fn(async () => ({
++      state,
++      fired: state.state === 'success' || state.state === 'failure',
++      summary: `Checks ${state.state} on ${state.sha.slice(0, 7)}: verify`,
++    }));
++    const { runtime, openCode, advance, removed } = await createRuntime({
++      catalog: [],
++      resolveCiHost: async () => IDENTITY,
++      checkCommitCI: checked,
++    });
++    const started = await runtime.startWait({ sessionID: SESSION, directory: DIRECTORY, source: 'ci', args: { url: URL_BRANCH } });
++    expect(started.waiting).toMatchObject({ source: 'ci', label: 'main', status: 'waiting' });
++    expect(checked.mock.calls[0][0]).toMatchObject({ ...IDENTITY, owner: 'Smartloft', repo: 'traefik-fabric', branch: 'main' });
++    expect(openCode.state.admitted).toHaveLength(0);
++
++    state = { sha: 'aaa1111', state: 'success' };
++    await advance(30_000);
++    await openCode.admitted();
++    expect(openCode.state.admitted).toHaveLength(1);
++    expect(openCode.state.admitted[0].text).toContain('Checks success on aaa1111: verify');
++    await removed(SESSION);
++    expect(runtime.snapshot().waits).toHaveLength(0);
++  });
++
++  it('wakes right away when the commit already has a verdict', async () => {
++    const { runtime, openCode } = await createRuntime({
++      catalog: [],
++      resolveCiHost: async () => IDENTITY,
++      checkCommitCI: async () => ({ state: { sha: 'aaa1111', state: 'failure' }, fired: true, summary: 'Checks failure on aaa1111: semgrep' }),
++    });
++    const started = await runtime.startWait({ sessionID: SESSION, directory: DIRECTORY, source: 'ci', args: { url: URL_COMMIT } });
++    expect(started.waiting.status).toBe('waking');
++    await openCode.admitted();
++    expect(openCode.state.admitted[0].text).toContain('Checks failure on aaa1111: semgrep');
++  });
++});
+diff --git a/packages/web/server/lib/extension-waits/runtime.ts b/packages/web/server/lib/extension-waits/runtime.ts
+index 495a0df..13749fe 100644
+--- a/packages/web/server/lib/extension-waits/runtime.ts
++++ b/packages/web/server/lib/extension-waits/runtime.ts
+@@ -54,6 +54,52 @@ const TIMER = {
+   params: { minutes: { type: 'number', description: `Whole minutes, 1 to ${TIMER_MINUTES_MAX}`, required: true } },
+ } satisfies PublicWaitSource;
+ 
++const CI_SOURCE = 'ci';
++const CI_INTERVAL_MS = 30_000;
++const CI = {
++  source: CI_SOURCE,
++  extension: 'OpenChamber',
++  title: 'CI',
++  description: 'Wakes the session when checks finish on a commit or a branch, with no pull request needed',
++  params: { url: { type: 'string', description: 'Address of a commit or branch on GitHub, GitLab, Gitea or Forgejo', required: true } },
++} satisfies PublicWaitSource;
++
++type CiTarget = { provider: string; instance: string; owner: string; repo: string; sha?: string; branch?: string };
++const ciStateSchema = z.object({ sha: z.string(), state: z.string() });
++type CiState = z.infer<typeof ciStateSchema>;
++type CiCheck = {
++  state?: CiState;
++  fired: boolean;
++  summary?: string;
++};
++type CiCheckerInput = CiTarget & { state?: CiState | undefined };
++
++const CI_COMMIT = /^\/([^/]+)\/([^/]+)\/(?:-\/)?commit\/([0-9a-f]{7,40})(?:\/|$)/i;
++const CI_BRANCH = /^\/([^/]+)\/([^/]+)\/(?:-\/tree|src\/branch|tree)\/(.+?)\/?$/;
++
++export const parseCiUrl = (value: string, identity?: { provider: string; instance: string } | null): CiTarget | null => {
++  const text = value.trim();
++  if (!text || !URL.canParse(text)) return null;
++  const url = new URL(text);
++  if (url.protocol !== 'https:' && url.protocol !== 'http:') return null;
++  const host = url.hostname.toLowerCase().replace(/^www\./, '');
++  const commit = CI_COMMIT.exec(url.pathname);
++  const branch = CI_BRANCH.exec(url.pathname);
++  if (!commit && !branch) return null;
++  const owner = (commit?.[1] ?? branch?.[1]) ?? '';
++  const repo = (commit?.[2] ?? branch?.[2]) ?? '';
++  if (!owner || !repo) return null;
++  const provider = identity?.provider ?? (url.pathname.includes('/-/') ? 'gitlab' : 'github');
++  const instance = identity?.instance ?? (provider === 'github' ? host : url.origin);
++  if (!instance) return null;
++  const target: CiTarget = { provider, instance, owner, repo };
++  if (commit?.[3]) target.sha = commit[3];
++  if (branch?.[3]) {
++    try { target.branch = decodeURIComponent(branch[3]); } catch { target.branch = branch[3]; }
++  }
++  return target;
++};
++
+ const ENDED_REASONS = {
+   unavailable: 'the extension was paused or removed, or its approval to wake sessions was withdrawn',
+   dropped: 'the extension no longer offers this wait',
+@@ -161,6 +207,8 @@ export interface ExtensionWaitsOptions extends Pick<SessionActivityOptions, 'bui
+   quietMs?: number;
+   retryDelayMs?: (failures: number) => number;
+   warn?: (...args: unknown[]) => void;
++  resolveCiHost?: (host: string) => Promise<{ provider: string; instance: string } | null>;
++  checkCommitCI?: (input: CiCheckerInput) => Promise<CiCheck | null>;
+ }
+ 
+ type Admission = {
+@@ -217,9 +265,11 @@ export const isWaitProvider = (guest: GuestRecord | null | undefined): guest is
+     && isGuestApproved({ requested: requestedGuestCapabilities(guest), granted });
+ };
+ 
+-const isTimer = (wait: Wait) => wait.guestId === null;
++const isBuiltin = (wait: Wait) => wait.guestId === null;
++const isTimer = (wait: Wait) => isBuiltin(wait) && wait.type === TIMER_SOURCE;
++const isCi = (wait: Wait) => isBuiltin(wait) && wait.type === CI_SOURCE;
+ 
+-const sourceOf = (wait: Wait) => (isTimer(wait) ? TIMER_SOURCE : `${wait.guestId}/${wait.type}`);
++const sourceOf = (wait: Wait) => (isTimer(wait) ? TIMER_SOURCE : isCi(wait) ? CI_SOURCE : `${wait.guestId}/${wait.type}`);
+ 
+ const minutesText = (minutes: WaitArgs[string]) => (minutes === 1 ? '1 minute' : `${minutes} minutes`);
+ 
+@@ -263,7 +313,11 @@ export function createExtensionWaitsRuntime({
+   quietMs = QUIET_MS,
+   retryDelayMs = retryDelay,
+   warn = (...args) => console.warn(...args),
++  resolveCiHost: initialResolveCiHost,
++  checkCommitCI: initialCheckCommitCI,
+ }: ExtensionWaitsOptions) {
++  let resolveCiHost = initialResolveCiHost;
++  let checkCommitCI = initialCheckCommitCI;
+   const filePath = path.join(dataDir, FILE_NAME);
+   const waits = new Map<string, Wait>();
+   let revision = 0;
+@@ -496,11 +550,46 @@ export function createExtensionWaitsRuntime({
+     scheduleChecks();
+   }
+ 
++  const checkCiWait = async (wait: Wait) => {
++    const parsedUrl = z.string().safeParse(wait.args.url);
++    const text = parsedUrl.success ? parsedUrl.data.trim() : '';
++    const host = (() => {
++      if (!text || !URL.canParse(text)) return null;
++      const url = new URL(text);
++      return url.protocol === 'https:' || url.protocol === 'http:' ? url.hostname.toLowerCase().replace(/^www\./, '') : null;
++    })();
++    const identity = host ? await resolveCiHost?.(host).catch(() => null) ?? null : null;
++    const target = parseCiUrl(text, identity);
++    if (!target || !checkCommitCI) {
++      wait.nextCheckAt = now() + CI_INTERVAL_MS;
++      return;
++    }
++    try {
++      const parsedState = ciStateSchema.safeParse(wait.state);
++      const result = await checkCommitCI({ ...target, state: parsedState.success ? parsedState.data : undefined });
++      if (!result) {
++        wait.nextCheckAt = now() + CI_INTERVAL_MS;
++        return;
++      }
++      if (result.state) wait.state = result.state;
++      if (result.fired) wait.wake = { outcome: 'fired', summary: result.summary ?? 'CI finished', messageID: null };
++      else wait.nextCheckAt = now() + CI_INTERVAL_MS;
++      checkFailures.delete(wait.id);
++    } catch (error) {
++      const failures = (checkFailures.get(wait.id) ?? 0) + 1;
++      checkFailures.set(wait.id, failures);
++      warn(`[extension-waits] CI check failed (${failureMessage(error) ?? error}); trying again later`);
++      wait.nextCheckAt = now() + Math.min(60_000 * 2 ** Math.max(failures - 1, 0), CHECK_BACKOFF_MAX_MS);
++    }
++  };
++
+   const checkDue = async (dueWaits: Wait[]) => {
+     for (const wait of dueWaits) {
+       if (isTimer(wait)) wait.wake = { outcome: 'fired', summary: `${minutesText(wait.args.minutes)} passed.`, messageID: null };
+     }
+-    const due = dueWaits.filter((wait) => !isTimer(wait));
++    const ci = dueWaits.filter(isCi);
++    if (ci.length > 0) await Promise.all(ci.map(checkCiWait));
++    const due = dueWaits.filter((wait) => !isTimer(wait) && !isCi(wait));
+     if (due.length === 0) return;
+     let providers;
+     try {
+@@ -658,7 +747,7 @@ export function createExtensionWaitsRuntime({
+     try {
+       await openCodeRequest(`/api/session/${encodeURIComponent(sessionID)}/synthetic`, {
+         method: 'POST',
+-        body: { id: wait.wake.messageID, ...buildWakeMessage(wait, sourceOf(wait), isTimer(wait)), delivery: 'steer', resume: true },
++        body: { id: wait.wake.messageID, ...buildWakeMessage(wait, sourceOf(wait), isBuiltin(wait)), delivery: 'steer', resume: true },
+       });
+     } catch (error) {
+       if (failureStatus(error) !== 409 && failureStatus(error) !== 404) return retry(wait, failureMessage(error) ?? String(error));
+@@ -682,7 +771,7 @@ export function createExtensionWaitsRuntime({
+     } catch (error) {
+       throw httpError(`The extension catalog could not be read: ${failureMessage(error) ?? error}`, 503);
+     }
+-    const sources: PublicWaitSource[] = insideSpace ? [] : [{ ...TIMER, params: { ...TIMER.params } }];
++    const sources: PublicWaitSource[] = insideSpace ? [] : [{ ...TIMER, params: { ...TIMER.params } }, { ...CI, params: { ...CI.params } }];
+     for (const guest of providers.values()) for (const wait of guest.waits) sources.push(toPublicSource(guest, wait));
+     return { waiting: waitsOf(sessionID).map(toPublicWait), sources };
+   };
+@@ -692,6 +781,7 @@ export function createExtensionWaitsRuntime({
+     const sessionID = requireSession(rawSessionID, 'wait.start');
+     const name = isTextInput(source) ? source.trim() : '';
+     if (name === TIMER_SOURCE) return startTimer({ sessionID, directory, rawArgs });
++    if (name === CI_SOURCE) return startCI({ sessionID, directory, rawArgs });
+     const match = /^([a-z][a-z0-9-]*)\/([a-z][a-z0-9-]*)$/.exec(name);
+     if (!match) throw httpError('source must be "timer", or "<extension>/<wait>" as wait.list names it', 400);
+     const guestId = match[1] ?? '';
+@@ -754,6 +844,51 @@ export function createExtensionWaitsRuntime({
+     }
+   };
+ 
++  const startCI = async ({ sessionID, directory, rawArgs }: { sessionID: string; directory: StartWaitInput['directory']; rawArgs: unknown }) => {
++    const args = parseArgs(CI.params, rawArgs);
++    const text = String(args.url ?? '').trim();
++    const host = (() => {
++      if (!text || !URL.canParse(text)) return null;
++      const url = new URL(text);
++      return url.protocol === 'https:' || url.protocol === 'http:' ? url.hostname.toLowerCase().replace(/^www\./, '') : null;
++    })();
++    const identity = host ? await resolveCiHost?.(host).catch(() => null) ?? null : null;
++    const target = parseCiUrl(text, identity);
++    if (!target) throw httpError('url must be the address of a commit or a branch on a connected Git host', 400);
++    if (!checkCommitCI) throw httpError('CI status is not available on this server', 503);
++    await load();
++    const release = reserve(sessionID);
++    try {
++      const baseline = await checkCommitCI({ ...target }).catch(() => null);
++      if (!baseline) throw httpError('The commit or branch could not be read, or no CI account is connected', 400);
++      const startedAt = now();
++      const label = target.branch ?? (target.sha ? target.sha.slice(0, 7) : null);
++      const record: Wait = {
++        id: `wait_${createId()}`,
++        sessionID,
++        directory: directory || null,
++        guestId: null,
++        extensionName: null,
++        type: CI_SOURCE,
++        title: `${CI.title} · ${target.owner}/${target.repo}`,
++        label,
++        args,
++        state: baseline.state ?? null,
++        startedAt,
++        nextCheckAt: startedAt + CI_INTERVAL_MS,
++        failingSince: null,
++        wake: baseline.fired
++          ? { outcome: 'fired', summary: baseline.summary ?? `CI ${baseline.state?.state ?? 'finished'}`, messageID: null }
++          : null,
++      };
++      const result = await keepWait(record, release, `A message arrives in this session when CI finishes on ${label ?? 'this ref'}. One wake ends the wait. End your turn now if you have nothing else to do; never wait with a sleep loop.`);
++      if (record.wake) arm(sessionID, 0);
++      return result;
++    } finally {
++      release();
++    }
++  };
++
+   const reserve = (sessionID: string) => {
+     const held = reservations.get(sessionID) ?? 0;
+     if (waitsOf(sessionID).length + held >= MAX_WAITS_PER_SESSION) {
+@@ -846,7 +981,7 @@ export function createExtensionWaitsRuntime({
+     } catch {
+       return;
+     }
+-    const pending = Array.from(waits.values()).filter((wait) => !wait.wake && !isTimer(wait));
++    const pending = Array.from(waits.values()).filter((wait) => !wait.wake && !isBuiltin(wait));
+     const unavailable = pending.filter((wait) => wait.guestId === null || !providers.has(wait.guestId));
+     const dropped = pending.filter((wait) => {
+       const guest = wait.guestId === null ? undefined : providers.get(wait.guestId);
+@@ -903,6 +1038,13 @@ export function createExtensionWaitsRuntime({
+   };
+ 
+   return {
++    attach: ({ resolveCiHost: hostResolver, checkCommitCI: checker }: {
++      resolveCiHost?: ExtensionWaitsOptions['resolveCiHost'];
++      checkCommitCI?: ExtensionWaitsOptions['checkCommitCI'];
++    } = {}) => {
++      if (hostResolver) resolveCiHost = hostResolver;
++      if (checker) checkCommitCI = checker;
++    },
+     load,
+     snapshot,
+     listWaits,
+diff --git a/packages/web/server/lib/extension-waits/wake-message.ts b/packages/web/server/lib/extension-waits/wake-message.ts
+index 7ffaaf0..3ea3e02 100644
+--- a/packages/web/server/lib/extension-waits/wake-message.ts
++++ b/packages/web/server/lib/extension-waits/wake-message.ts
+@@ -30,11 +30,11 @@ const cleanText = (text: string) => text.replace(/[<>]/g, '').trim();
+ 
+ export const subjectOf = (wait: WaitSubject) => (wait.label ? `${cleanText(wait.title)} (${cleanText(wait.label)})` : cleanText(wait.title));
+ 
+-export const buildWakeMessage = (wait: WakingWait, source: string, timer: boolean) => {
++export const buildWakeMessage = (wait: WakingWait, source: string, builtin: boolean) => {
+   const subject = subjectOf(wait);
+   const summary = cleanText(wait.wake.summary);
+   const fired = wait.wake.outcome === 'fired';
+-  const report = timer
++  const report = builtin
+     ? [`${subject} fired: ${summary}`]
+     : [`${subject} fired. What the extension "${wait.guestId}" reports, its own words and not the user's:`, summary];
+   const lines = fired
+@@ -55,7 +55,7 @@ export const buildWakeMessage = (wait: WakingWait, source: string, timer: boolea
+       title: wait.title,
+       label: wait.label,
+       outcome: wait.wake.outcome,
+-      minutes: timer ? wait.args.minutes : null,
++      minutes: wait.type === 'timer' ? wait.args.minutes : null,
+       subject,
+       summary,
+     },
+diff --git a/packages/web/server/lib/gitea/provider.ts b/packages/web/server/lib/gitea/provider.ts
+index 0f9cda9..28549ad 100644
+--- a/packages/web/server/lib/gitea/provider.ts
++++ b/packages/web/server/lib/gitea/provider.ts
+@@ -309,6 +309,8 @@ export function createGiteaFamilyProvider(build: GiteaFamilyProviderOptions) {
+       readChangeRequestFile: ({ session, directory, number, sourceRepo, remote, path, previousPath, status, binary, linked }: PatchRead & Pick<Parameters<Service['changeRequestFileContents']>[2], 'path' | 'previousPath' | 'status' | 'binary'>) => serviceFor(session)
+         .changeRequestFileContents(directory, number, { project: projectSelector(sourceRepo), remote, path, previousPath, status, binary, linked }),
+       liveSummaries: ({ session, refs, issueRefs }: { session: ProviderSession } & Parameters<Service['liveSummaries']>[0]) => serviceFor(session).liveSummaries({ refs, issueRefs }),
++      commitStatus: async ({ session, project, sha, branch }: { session: ProviderSession } & Parameters<Service['commitStatus']>[0]) =>
++        await serviceFor(session).commitStatus({ project, sha, branch }) ?? { sha: '', state: 'unknown', names: [] },
+       readChangeRequestHead: async ({ session, directory, remote, number }: NumberedRead) => {
+         const { request, headProject } = await serviceFor(session).findChangeRequest(directory, number, null, remote);
+         const headSha = String(request.headSha || '').toLowerCase();
+diff --git a/packages/web/server/lib/gitea/resources.ts b/packages/web/server/lib/gitea/resources.ts
+index e3be9a4..8a18580 100644
+--- a/packages/web/server/lib/gitea/resources.ts
++++ b/packages/web/server/lib/gitea/resources.ts
+@@ -351,6 +351,19 @@ export function createGiteaResourceService({
+   };
+ 
+   return {
++    async commitStatus(input: { session?: unknown; project: Repository; sha?: string | undefined; branch?: string | undefined }) {
++      const { project } = input;
++      let sha = isString(input.sha) && input.sha ? input.sha : null;
++      if (!sha && isString(input.branch) && input.branch) {
++        const branch = await client.get(`${repoPath(project)}/branches/${seg(input.branch)}`);
++        const commit = field(branch, 'commit');
++        const id = field(commit, 'id');
++        sha = isString(id) && id ? id : null;
++      }
++      if (!sha) return { sha: '', state: 'unknown', names: [] };
++      const ci = await readCI(project, sha);
++      return { sha, state: ci?.summary?.state ?? 'unknown', names: (ci?.runs ?? []).map((run: { name?: string }) => run.name).filter(isString) };
++    },
+     async changeRequestStatus(directory: string, branch: string, remote?: Remote) {
+       const sources = await resolveDirectoryRepos(directory, remote);
+       const targets = await withParents(sources, { requireComplete: true });
+diff --git a/packages/web/server/lib/openchamber-control/actions.ts b/packages/web/server/lib/openchamber-control/actions.ts
+index 81198f2..3793e5d 100644
+--- a/packages/web/server/lib/openchamber-control/actions.ts
++++ b/packages/web/server/lib/openchamber-control/actions.ts
+@@ -17,7 +17,7 @@ export const OPENCHAMBER_CONTROL_ACTION_DEFINITIONS = Object.freeze([
+   { action: 'pr.watch', title: 'Wait on a pull request', description: 'Requires url of a GitHub pull request or GitLab merge request. Same as wait.start with source "pr"', agentExposed: false },
+   { action: 'pr.unwatch', title: 'Stop waiting on a pull request', description: 'This session stops waiting on the pull request at url, or on every one without url', agentExposed: false },
+   { action: 'wait.list', title: 'List waits', description: "This session's waits, and the sources to wait on (the built-in timer, pull requests, and what extensions offer), with the args each takes" },
+-  { action: 'wait.start', title: 'Wait on a timer, a pull request or an extension', description: 'Requires source and args: "timer" with { "minutes": N } (1 to 1440); "pr" with { "url": "<GitHub pull request or GitLab merge request address>" }, which wakes the session when a check fails or every check passes, someone comments or reviews, the branch conflicts or falls behind, or it is merged or closed; or a source from wait.list with args as its params say. Each pull request is its own wait, so a session can wait on several. One wake ends the wait, so start it again to keep waiting. End your turn while you wait. Never wait with a sleep loop' },
++  { action: 'wait.start', title: 'Wait on a timer, CI, a pull request or an extension', description: 'Requires source and args: "timer" with { "minutes": N } (1 to 1440); "ci" with { "url": "<commit or branch address>" }, which wakes the session when checks finish on that ref, with no pull request needed; "pr" with { "url": "<GitHub pull request, GitLab merge request, or Gitea/Forgejo pull request address>" }, which wakes the session when a check fails or every check passes, someone comments or reviews, the branch conflicts or falls behind, or it is merged or closed; or a source from wait.list with args as its params say. Each pull request is its own wait, so a session can wait on several. One wake ends the wait, so start it again to keep waiting. End your turn while you wait. Never wait with a sleep loop' },
+   { action: 'wait.stop', title: 'Stop a wait', description: 'Stop waitId (a pull request wait\'s waitId is its address), or every wait of this session without it' },
+   { action: 'work.name', title: 'Name the task', description: 'Name the worktree\'s or isolated space\'s task for sessionId (default: this session), never a session; a lead\'s name is its session title, so for a lead it renames the session. In title: at most 4 words in the user\'s latest language; rename only for a different task. A user-given name stays. Main checkout and plain folders need no naming. A worktree on an OpenChamber-generated placeholder branch also requires branch, the English branch name after the task, and renames it; any other branch stays' },
+   { action: 'lead.brief', title: "Keep the lead's brief", description: 'Only in a lead session. Without brief or edits it returns the brief; edits changes parts of it, brief replaces it whole' },
+diff --git a/packages/web/server/lib/server-frame/feature-routes-runtime.ts b/packages/web/server/lib/server-frame/feature-routes-runtime.ts
+index dbf1685..6fe4ac8 100644
+--- a/packages/web/server/lib/server-frame/feature-routes-runtime.ts
++++ b/packages/web/server/lib/server-frame/feature-routes-runtime.ts
+@@ -703,7 +703,42 @@ export const createFeatureRoutesRuntime = (dependencies: FeatureRuntimeDependenc
+       }
+     });
+     registerTrackedItemsRoutes(app, { service: trackedItemsService });
+-    prWatchRuntime?.attach({ trackedItems: trackedItemsService, readers: trackedItemReaders });
++    const resolveHostIdentity = async (host: string) => {
++      for (const descriptor of sourceControlProviders.list()) {
++        try {
++          const impl = await sourceControlProviders.implementation(descriptor.id);
++          if (!(impl?.auth?.ownsHost instanceof Function)) continue;
++          const knownInstances = [...(descriptor.instance.defaultInstances ?? []), ...(await impl.auth.listInstances?.() ?? [])];
++          const knownSshHosts = await impl.auth.listSshHosts?.() ?? [];
++          const instance = impl.auth.ownsHost({ host, knownInstances, knownSshHosts });
++          if (instance) return { provider: descriptor.id, instance };
++        } catch {
++          continue;
++        }
++      }
++      return null;
++    };
++    extensionWaitsRuntime?.attach({
++      resolveCiHost: resolveHostIdentity,
++      checkCommitCI: async ({ provider, instance, owner, repo, sha, branch, state }) => {
++        const descriptor = sourceControlProviders.describe(provider);
++        const impl = await sourceControlProviders.implementation(provider);
++        if (!descriptor || !impl?.resources?.commitStatus) return null;
++        const session = await impl.auth.resolveAccount({ instance: descriptor.instance.normalize(instance), orCurrent: true });
++        const result = await impl.resources.commitStatus({ session, project: { owner, name: repo }, sha, branch });
++        if (!result || !result.sha) return null;
++        const next = { sha: result.sha, state: result.state };
++        const terminal = result.state === 'success' || result.state === 'failure';
++        const changed = !state || state.sha !== result.sha || state.state !== result.state;
++        const names = result.names.length > 0 ? `: ${result.names.join(', ')}` : '';
++        return {
++          state: next,
++          fired: terminal && changed,
++          summary: `Checks ${result.state} on ${result.sha.slice(0, 7)}${names}`,
++        };
++      },
++    });
++
+     void mergeFollowRuntime?.attach(trackedItemsService).catch((error) => console.warn('[merge-follow] attach failed:', error.message));
+     const resolveGitIdentity = async (identityId: string) => {
+       if (identityId === 'global') {
+diff --git a/packages/web/server/lib/source-control/provider-contract.d.ts b/packages/web/server/lib/source-control/provider-contract.d.ts
+index 3b98419..3abf4ad 100644
+--- a/packages/web/server/lib/source-control/provider-contract.d.ts
++++ b/packages/web/server/lib/source-control/provider-contract.d.ts
+@@ -282,6 +282,8 @@ export interface ProviderImplementation<MutationInput = Json, ProviderTarget = J
+       revision?: string; binary?: true | undefined; linked?: true;
+     }): Promise<Json>;
+     liveSummaries?(input: { session: ProviderSession; refs: ThreadRef[]; issueRefs: ThreadRef[]; discussionRefs: ThreadRef[]; details: boolean }): Promise<Omit<LiveSummariesResult, 'connected'>>;
++    /** Combined commit/branch CI status, for the built-in `ci` wait. */
++    commitStatus?(input: { session: ProviderSession; project: { owner: string; name: string }; sha?: string | undefined; branch?: string | undefined }): Promise<{ sha: string; state: string; names: string[] } | null>;
+     readChangeRequestHead?(input: ReadInput & { number: number }): Promise<{
+       project: { id: string; owner: string; name: string }; headSha: string; headBranch: string; headOwner: string;
+     }>;
